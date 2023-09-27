@@ -1,0 +1,172 @@
+#--------------------------------------------------------------------------------#
+# Archivo de lamps para calentar el cluster a las diferentes temperaturas,       #
+# para llamarlo se debe de ejecutar el codigo de la forma:                       #
+#                                                                                #
+# (EXEC) -in ../../in.cicle -v file MiArchivo.data -v t (Temp) -v iter (#cycle)  #
+#                                                                                #
+# deberia servir de manera generica, aun que hay que modificar ciertos           #
+# puntos para que eso sea posible.                                               #
+# Debido a que la version de lammps utilizada es la 2014 este codigo ya es       #
+# desactualizado y debe actualizarce                                             #
+#                                                                (Ver. 2.2)      #
+#--------------------------------------------------------------------------------#
+
+##-- Parametros del Script --##
+variable	debug equal 0
+variable	tc equal 30000
+variable	ramp equal 5000
+variable	Tlow equal 300
+variable	dT equal 50
+variable	ltry equal 1
+variable	lvry equal 2
+variable	Tc equal ${t}
+variable	cratio equal 4000 # 4 K^-1.ps -> 0.25 K.ps^-1
+variable	cratio equal 100 # 0.1 K^-1.ps -> 10 K.ps^-1 --test
+variable	tfinal equal 2000000
+variable	tfinal equal 50000 # 50ps last stab time --test
+variable	supershrink equal 1
+
+##-- Definiendo unidades --##
+units		metal		# amstrongs/ps system
+pair_style	eam/alloy
+boundary	f f f		# Borders fixed
+atom_style	atomic
+
+#--Setting startup point
+read_data	${file}
+pair_coeff	* * ../FeNiCrCoCu-hardened.eam.alloy.good Fe Ni Cr Co Cu
+velocity	all zero angular
+
+#--Minimization to adjust Cluster
+minimize	0 1e-4 1000 10000
+
+#--Computes
+compute		atmpe all pe/atom
+compute		redpe all reduce ave c_atmpe
+compute		atmke all ke/atom
+compute		redke all reduce ave c_atmke
+compute		strss all stress/atom NULL virial
+compute		redstr all reduce ave c_strss[1]
+
+#--Reset steps and calculating computes
+reset_timestep	0
+thermo_style	custom step temp pe ke etotal c_redpe c_redke c_redstr
+thermo		1000
+run		0
+
+#--Variables
+variable	n loop $(v_iter)
+variable	thot equal v_ramp+v_tc
+variable	enmin equal $(c_redpe)
+variable	en0 equal c_redpe
+variable	seed equal floor(random(1000000,9999999,${rnd}))
+variable	check equal random(0,1,${rnd})
+variable	comparison equal (v_enmin-v_en0)/(8.617e-5*v_Tlow)
+variable	prob equal exp(v_comparison)
+variable	failed equal -1
+variable	failcheck equal round((abs(v_failed-v_ltry)+v_failed-v_ltry)/2)%v_lvry
+
+#--Preparando el inicio
+reset_timestep	${n}
+run		0
+print		"#Ciclo  Energia(eV/atom) Failed Tc(K)" file Cicle_status.dat
+if		"${debug}!=0" then "print '#Ciclo Failed dE/KT exp[dE] rnd status' file log.attemps"
+print		"0 ${enmin} 0 ${Tc}" append Cicle_status.dat
+write_dump	all custom Configs_${n}.dump id element x y z c_atmpe c_atmke c_strss[1] c_strss[2] c_strss[3] c_strss[4] c_strss[5] c_strss[6] modify element Fe Ni Cr Co Cu append no
+write_dump	all custom cold.dump id element x y z vx vy vz c_atmpe modify element Fe Ni Cr Co Cu append no
+
+#--Ciclos de annealing
+label annealing
+
+if		"${failed}==-1" then "variable Tc equal ${Tc}+${dT}"
+if		"${Tc}>${t}" then "variable Tc equal ${t}"
+variable	failed equal ${failed}+1
+read_dump	cold.dump ${n} x y z vx vy vz replace yes box yes 
+reset_timestep	0
+velocity	all create ${Tlow} ${seed} rot yes
+fix		clus_out all ave/time 5 100 5000 c_thermo_temp c_thermo_pe file ciclo_${n}.dat title1 "#Salida del ciclo No ${n}"
+#dump		salida all custom 20000 Salida_ciclo_${n}.dump id element x y z vx vy vz c_atmpe
+#dump_modify	salida element Fe Ni Cr Co Cu
+
+fix		cluster_ens all nvt temp ${Tlow} ${Tc} 0.01
+run		${ramp}
+
+fix		cluster_ens all nvt temp ${Tc} ${Tc} 0.01
+run		${tc}
+
+write_dump	all custom tmp.dump id element x y z vx vy vz c_atmpe modify element Fe Ni Cr Co Cu append no
+#write_restart	hot_${n}.res
+
+fix		cluster_ens all nvt temp ${Tc} ${Tlow} 0.01
+run		${ramp}
+
+#undump		salida
+unfix		clus_out
+unfix		cluster_ens
+
+#--Minimizacion and check
+minimize	1e-6 1e-6 1000 10000
+run		0
+
+if 		"${failcheck}==1" then "variable Tc equal ${Tc}-${dT}"
+if		"${Tc}<${Tlow}" then "variable supershrink equal 0" "variable Tc equal $(v_t/2)"
+if		"${debug}!=0" then "jump SELF debug"
+if		"${comparison} >= 0" then "jump SELF save"
+if		"${supershrink}>0" then "jump SELF annealing"
+if		"${prob} > ${check}" then "jump SELF save"
+jump		SELF annealing
+
+label		debug
+variable	debug_check equal ${check}
+if		"${comparison} >= 0" then "jump SELF DebugPass"
+if		"${supershrink}>0" then "jump SELF DebugFail"
+if		"${prob} > ${debug_check}" then "jump SELF DebugSave"
+
+label		DebugFail
+print		"${n} ${failed} ${comparison} ${prob} ${debug_check} FAILED" append log.attemps
+jump  	    	SELF annealing
+
+label		DebugPass
+print		"${n} ${failed} ${comparison} >1 - PASS" append log.attemps
+jump		SELF save
+
+label		DebugSave
+print		"${n} ${failed} ${comparison} ${prob} ${debug_check} PASS" append log.attemps
+jump		SELF save
+
+label		save
+shell		mv tmp.dump hot.dump
+print		"${n} $(c_redpe) ${failed} ${Tc}" append Cicle_status.dat
+variable	enmin equal $(c_redpe)
+variable	failed equal -1
+
+reset_timestep	${n} #<-- Para escribir el ciclo en el archivo Configs.dump
+run		0
+write_dump	all custom Configs_${n}.dump id element x y z c_atmpe c_atmke c_strss[1] c_strss[2] c_strss[3] c_strss[4] c_strss[5] c_strss[6] modify element Fe Ni Cr Co Cu append no 
+
+reset_timestep	$(v_n+1) #<-- Para escribir el siguiente ciclo en el archivo cold.dump
+run		0
+write_dump	all custom cold.dump id element x y z vx vy vz modify element Fe Ni Cr Co Cu append no
+
+next		n
+jump		SELF annealing
+
+#--Slow cooling
+read_dump	hot.dump ${thot} x y z vx vy vz replace yes box yes 
+fix		clus_out all ave/time 5 100 5000 c_thermo_temp c_thermo_pe file final_cool.dat title1 "#Salida del ciclo N°$(v_iter+1)" #<-- Agregue la presion al asunto $
+#dump		salida all custom 40000 Salida_lastcool.dump id element x y z vx vy vz c_atmpe
+#dump_modify	salida element Fe Ni Cr Co Cu
+
+fix		cluster_ens all nvt temp ${Tc} ${Tlow} 0.01
+run		$((v_t - v_Tlow)*v_cratio)
+
+fix		cluster_ens all nvt temp ${Tlow} ${Tlow} 0.01
+run		${tfinal}
+
+minimize	1e-6 1e-6 1000 10000
+
+unfix		clus_out
+print		'$(v_iter+1) $(c_redpe) 0 ${Tlow}' append Cicle_status.dat
+reset_timestep 	$(v_iter+1)
+run 	       	0
+write_dump     	all custom Final_config.dump id element x y z c_atmpe c_atmke c_strss[1] c_strss[2] c_strss[3] c_strss[4] c_strss[5] c_strss[6] modify element Fe Ni Cr Co Cu append yes
